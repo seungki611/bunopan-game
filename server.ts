@@ -259,7 +259,7 @@ async function startServer() {
   wss.on("connection", (ws: WebSocket) => {
     ws.on("message", (rawMessage: string) => {
       try {
-        const msg = JSON.parse(rawMessage) as WSMessage;
+        const msg = JSON.parse(rawMessage) as any;
 
         switch (msg.type) {
           case "create_room": {
@@ -324,8 +324,9 @@ async function startServer() {
           }
 
           case "set_plate": {
-            const client = clients.get(ws);
+            const client = clients.get(ws) || (msg.roomCode && msg.playerId ? { roomCode: msg.roomCode.toUpperCase(), playerId: msg.playerId, ws } : null);
             if (!client) break;
+            if (!clients.has(ws)) clients.set(ws, client);
             const room = rooms.get(client.roomCode);
             if (!room || room.hostId !== client.playerId) break;
 
@@ -339,8 +340,9 @@ async function startServer() {
           }
 
           case "submit_equation": {
-            const client = clients.get(ws);
+            const client = clients.get(ws) || (msg.roomCode && msg.playerId ? { roomCode: msg.roomCode.toUpperCase(), playerId: msg.playerId, ws } : null);
             if (!client) break;
+            if (!clients.has(ws)) clients.set(ws, client);
             const room = rooms.get(client.roomCode);
             if (!room || room.locked) break;
 
@@ -369,8 +371,9 @@ async function startServer() {
           }
 
           case "judge_submission": {
-            const client = clients.get(ws);
+            const client = clients.get(ws) || (msg.roomCode && msg.playerId ? { roomCode: msg.roomCode.toUpperCase(), playerId: msg.playerId, ws } : null);
             if (!client) break;
+            if (!clients.has(ws)) clients.set(ws, client);
             const room = rooms.get(client.roomCode);
             if (!room || room.hostId !== client.playerId) break;
 
@@ -395,8 +398,9 @@ async function startServer() {
           }
 
           case "next_round": {
-            const client = clients.get(ws);
+            const client = clients.get(ws) || (msg.roomCode && msg.playerId ? { roomCode: msg.roomCode.toUpperCase(), playerId: msg.playerId, ws } : null);
             if (!client) break;
+            if (!clients.has(ws)) clients.set(ws, client);
             const room = rooms.get(client.roomCode);
             if (!room || room.hostId !== client.playerId) break;
 

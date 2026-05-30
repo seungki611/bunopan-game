@@ -227,11 +227,13 @@ export default function App() {
     }
   };
 
-  // HTTP Polling Fallback Effect when WebSocket is not online
+  // HTTP Polling Fallback Effect - Hybrid Sync
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
     
-    if (roomCode && !connected && room) {
+    if (roomCode && room) {
+      const pollIntervalMs = connected ? 4000 : 1500; // safety slow-poll when WS is active, fast-poll when fallback
+      
       interval = setInterval(async () => {
         try {
           const res = await fetch(`/api/rooms/${roomCode}?playerId=${playerId}`);
@@ -250,13 +252,39 @@ export default function App() {
         } catch (err) {
           console.error("HTTP Polling synced state error:", err);
         }
-      }, 1500);
+      }, pollIntervalMs);
     }
 
     return () => {
       if (interval) clearInterval(interval);
     };
   }, [roomCode, connected, room, playerId]);
+
+  // Automatically reset canvas and inputs when round advances
+  const prevRoundRef = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (room?.game?.round !== undefined) {
+      if (prevRoundRef.current !== undefined && room.game.round > prevRoundRef.current) {
+        // Round changed! Clear drawing layout & user inputs
+        whiteboardRef.current?.clearCanvas();
+        setTypedEquation("");
+      }
+      prevRoundRef.current = room.game.round;
+    }
+  }, [room?.game?.round]);
+
+  // Automatically sync WebSocket state with room code when online
+  useEffect(() => {
+    if (connected && room?.roomCode && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      const cleanName = playerName || getPersistedName() || "플레이어";
+      wsRef.current.send(JSON.stringify({
+        type: "join_room",
+        roomCode: room.roomCode,
+        playerName: cleanName,
+        playerId
+      }));
+    }
+  }, [connected, room?.roomCode, playerId, playerName]);
 
   useEffect(() => {
     return () => {
