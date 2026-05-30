@@ -1,0 +1,6 @@
+{
+  "name": "License Plate Equation Game",
+  "description": "A real-time multiplayer game where players compete to make valid equations from car license plate numbers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
