@@ -78,16 +78,59 @@ export default function App() {
     }
   }, []);
 
-  // Web socket sync handler
-  const sendWSMessage = (msg: WSMessage) => {
+  // HTTP/WS unified action sender
+  const executeAction = async (action: string, payload: any = {}) => {
+    const currentCode = room?.roomCode || roomCode;
+    if (!currentCode) return;
+
+    // Try WebSocket first
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg));
-    } else {
-      setErrorMsg("서버와 연결되어 있지 않습니다. 재연결을 시도합니다.");
+      let type = "";
+      switch (action) {
+        case "set_plate": type = "set_plate"; break;
+        case "submit_equation": type = "submit_equation"; break;
+        case "judge_submission": type = "judge_submission"; break;
+        case "next_round": type = "next_round"; break;
+        case "leave_room": type = "leave_room"; break;
+      }
+      if (type) {
+        wsRef.current.send(JSON.stringify({
+          type,
+          roomCode: currentCode,
+          playerId,
+          ...payload
+        }));
+        return;
+      }
+    }
+
+    // HTTP Action Fallback
+    try {
+      const response = await fetch(`/api/rooms/${currentCode}/action`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action,
+          playerId,
+          payload
+        })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.room) {
+          setRoom(data.room);
+          setErrorMsg(null);
+        }
+      } else {
+        const errorData = await response.json().catch(() => ({}));
+        setErrorMsg(errorData.error || "작업을 수행하는 중 오류가 발생했습니다.");
+      }
+    } catch (err) {
+      console.error("HTTP action fallback failed:", err);
     }
   };
 
-  // Connect to WS
+  // Connect to WS (Optimistic attempt)
   const connectWebSocket = (callbackOnOpen?: () => void) => {
     if (wsRef.current) {
       wsRef.current.close();
@@ -99,84 +142,121 @@ export default function App() {
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${wsProtocol}//${window.location.host}`;
     
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    try {
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
-    ws.onopen = () => {
-      setConnected(true);
+      ws.onopen = () => {
+        setConnected(true);
+        setConnecting(false);
+        setStatusText("연결 성공!");
+        setErrorMsg(null);
+        if (callbackOnOpen) {
+          callbackOnOpen();
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data) as WSMessage;
+
+          switch (msg.type) {
+            case "sync_state":
+              if (msg.error) {
+                setErrorMsg(msg.error);
+                setRoom(null);
+                setRole(null);
+              } else if (msg.room) {
+                setRoom(msg.room);
+                setErrorMsg(null);
+                if (msg.room.hostId === playerId) {
+                  setRole("host");
+                } else {
+                  setRole("player");
+                }
+              }
+              break;
+
+            case "new_submission_toast":
+              // Handle toast if wanted
+              break;
+          }
+        } catch (err) {
+          console.error("Error handling message:", err);
+        }
+      };
+
+      ws.onclose = () => {
+        setConnected(false);
+        setConnecting(false);
+        setStatusText("연결 일시중단 (HTTP 우회)");
+        
+        // Quietly reconnect in background
+        reconnectTimeoutRef.current = setTimeout(() => {
+          connectWebSocket(() => {
+            if (roomCode) {
+              const cleanName = playerName || getPersistedName() || "참가자";
+              if (role === "host") {
+                wsRef.current?.send(JSON.stringify({
+                  type: "create_room",
+                  hostName: cleanName,
+                  playerId
+                }));
+              } else {
+                wsRef.current?.send(JSON.stringify({
+                  type: "join_room",
+                  roomCode,
+                  playerName: cleanName,
+                  playerId
+                }));
+              }
+            }
+          });
+        }, 5000);
+      };
+
+      ws.onerror = () => {
+        setConnecting(false);
+        setConnected(false);
+        console.warn("WebSocket fallback activated: using HTTP polling.");
+      };
+    } catch (e) {
       setConnecting(false);
-      setStatusText("연결 성공!");
-      setErrorMsg(null);
-      if (callbackOnOpen) {
-        callbackOnOpen();
-      }
-    };
+      setConnected(false);
+      console.warn("WebSocket initialization failed:", e);
+    }
+  };
 
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data) as WSMessage;
-
-        switch (msg.type) {
-          case "sync_state":
-            if (msg.error) {
-              setErrorMsg(msg.error);
-              setRoom(null);
-              setRole(null);
-            } else if (msg.room) {
-              setRoom(msg.room);
-              setErrorMsg(null);
-              // Make sure to sync roles
-              if (msg.room.hostId === playerId) {
+  // HTTP Polling Fallback Effect when WebSocket is not online
+  useEffect(() => {
+    let interval: NodeJS.Timeout | null = null;
+    
+    if (roomCode && !connected && room) {
+      interval = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/rooms/${roomCode}?playerId=${playerId}`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.success && data.room) {
+              setRoom(data.room);
+              // Ensure roles sync
+              if (data.room.hostId === playerId) {
                 setRole("host");
               } else {
                 setRole("player");
               }
             }
-            break;
-
-          case "new_submission_toast":
-            // Plays a subtle visual effect if host/audience
-            break;
-        }
-      } catch (err) {
-        console.error("Error handling message:", err);
-      }
-    };
-
-    ws.onclose = () => {
-      setConnected(false);
-      setConnecting(false);
-      setStatusText("연결 끊김. 재정비 중...");
-      
-      // Auto-reconnect after 3 seconds
-      reconnectTimeoutRef.current = setTimeout(() => {
-        connectWebSocket(() => {
-          // On reconnection, rejoin the room if code was set
-          if (roomCode) {
-            if (role === "host") {
-              sendWSMessage({
-                type: "create_room",
-                hostName: playerName || "호스트",
-                playerId
-              });
-            } else {
-              sendWSMessage({
-                type: "join_room",
-                roomCode: roomCode,
-                playerName: playerName || `참가자_${playerId.substring(2, 6)}`,
-                playerId
-              });
-            }
           }
-        });
-      }, 3000);
-    };
+        } catch (err) {
+          console.error("HTTP Polling synced state error:", err);
+        }
+      }, 1500);
+    }
 
-    ws.onerror = () => {
-      setConnecting(false);
-      setErrorMsg("연결 문제 발생. 서버 상태를 확인하세요.");
+    return () => {
+      if (interval) clearInterval(interval);
     };
-  };
+  }, [roomCode, connected, room, playerId]);
 
   useEffect(() => {
     return () => {
@@ -186,22 +266,44 @@ export default function App() {
   }, []);
 
   // Action: Create Room
-  const handleCreateRoom = (e: React.FormEvent) => {
+  const handleCreateRoom = async (e: React.FormEvent) => {
     e.preventDefault();
     const cleanName = playerName.trim() || "호스트";
     setPersistedName(cleanName);
+    setConnecting(true);
 
-    connectWebSocket(() => {
-      sendWSMessage({
-        type: "create_room",
-        hostName: cleanName,
-        playerId
+    // Kick off background optimistic websocket setup
+    connectWebSocket();
+
+    // Instantly create room via API endpoint to keep deployment ultra-resilient
+    try {
+      const res = await fetch("/api/rooms", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ playerId, hostName: cleanName }),
       });
-    });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.room) {
+          setRoom(data.room);
+          setRoomCode(data.room.roomCode);
+          setRole("host");
+          setConnecting(false);
+          setErrorMsg(null);
+          return;
+        }
+      }
+      const dataErr = await res.json().catch(() => ({}));
+      setErrorMsg(dataErr.error || "방 개설 중 문제가 생겼습니다.");
+    } catch (err) {
+      console.error("HTTP create room failed, trying websocket fallback:", err);
+      setErrorMsg("서버와의 통신이 원활하지 않습니다. 잠시 후 회복됩니다.");
+    }
+    setConnecting(false);
   };
 
   // Action: Join Room
-  const handleJoinRoom = (e: React.FormEvent) => {
+  const handleJoinRoom = async (e: React.FormEvent) => {
     e.preventDefault();
     const cleanName = playerName.trim() || `참가자_${Math.floor(1000 + Math.random() * 9000)}`;
     const cleanRoomCode = roomCode.trim().toUpperCase();
@@ -213,34 +315,47 @@ export default function App() {
 
     setPersistedName(cleanName);
     setRoomCode(cleanRoomCode);
+    setConnecting(true);
 
-    connectWebSocket(() => {
-      sendWSMessage({
-        type: "join_room",
-        roomCode: cleanRoomCode,
-        playerName: cleanName,
-        playerId
+    // Background WS connect
+    connectWebSocket();
+
+    // Directly execute joint request via REST API
+    try {
+      const res = await fetch(`/api/rooms/${cleanRoomCode}/join`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ playerId, playerName: cleanName }),
       });
-    });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.room) {
+          setRoom(data.room);
+          setRole(data.room.hostId === playerId ? "host" : "player");
+          setConnecting(false);
+          setErrorMsg(null);
+          return;
+        }
+      }
+      const dataErr = await res.json().catch(() => ({}));
+      setErrorMsg(dataErr.error || "방 입장 중 존재하지 않는 방 코드이거나 만료되었습니다.");
+    } catch (err) {
+      console.error("HTTP join room failed:", err);
+      setErrorMsg("서버 통신 실패. 방 입장에 실패했습니다.");
+    }
+    setConnecting(false);
   };
 
   // Action: Set Plate
   const handleSetPlate = () => {
     if (!customPlateInput.trim()) return;
-    sendWSMessage({
-      type: "set_plate",
-      roomCode: room?.roomCode || "",
-      plate: customPlateInput.trim()
-    });
+    executeAction("set_plate", { plate: customPlateInput.trim() });
     setCustomPlateInput("");
   };
 
   // Action: Generate Random Plate
   const handleRandomPlate = () => {
-    sendWSMessage({
-      type: "next_round", // server next_round handles random plate generation
-      roomCode: room?.roomCode || ""
-    });
+    executeAction("next_round");
   };
 
   // Action: Submit Equation Draw & Text
@@ -249,13 +364,11 @@ export default function App() {
     
     const dataUrl = whiteboardRef.current?.getImageDataUrl() || "";
     if (!dataUrl) {
-      setErrorMsg("풀이판에 필기 후 제출 해 주세요.");
+      setErrorMsg("풀이판에 필기 후 제출해 주세요.");
       return;
     }
 
-    sendWSMessage({
-      type: "submit_equation",
-      roomCode: room?.roomCode || "",
+    executeAction("submit_equation", {
       image: dataUrl,
       equationText: typedEquation.trim()
     });
@@ -263,20 +376,13 @@ export default function App() {
 
   // Action: Judge Score
   const handleJudge = (approved: boolean) => {
-    sendWSMessage({
-      type: "judge_submission",
-      roomCode: room?.roomCode || "",
-      approved
-    });
+    executeAction("judge_submission", { approved });
     setTypedEquation("");
     whiteboardRef.current?.clearCanvas();
   };
 
   const handleNextRound = () => {
-    sendWSMessage({
-      type: "next_round",
-      roomCode: room?.roomCode || ""
-    });
+    executeAction("next_round");
     setTypedEquation("");
     whiteboardRef.current?.clearCanvas();
   };
@@ -284,6 +390,9 @@ export default function App() {
   // Action: Leave Room
   const handleLeaveRoom = () => {
     if (wsRef.current) wsRef.current.close();
+    if (roomCode) {
+      executeAction("leave_room");
+    }
     setRoom(null);
     setRole(null);
     setRoomCode("");
@@ -365,6 +474,12 @@ export default function App() {
               <span className="flex items-center space-x-1.5 px-3 py-1 bg-amber-100 text-amber-800 text-xs font-black rounded-full border-2 border-amber-900 animate-pulse shadow-[2px_2px_0px_#78350f]">
                 <span className="w-2.5 h-2.5 rounded-full bg-amber-500" />
                 <span>연결 중</span>
+              </span>
+            )}
+            {!connected && !connecting && room && (
+              <span className="flex items-center space-x-1.5 px-3 py-1 bg-blue-100 text-blue-800 text-xs font-black rounded-full border-2 border-blue-900 shadow-[2px_2px_0px_#1e3a8a]" title="웹소켓 우회 모드: HTTP 폴링 상태">
+                <span className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse border border-blue-700" />
+                <span>실시간 (HTTP 우회) ⚡</span>
               </span>
             )}
             {room && (
